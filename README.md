@@ -57,6 +57,31 @@ ever growing the dataset — see `tests/storage_smoke.rs` for tests
 covering both the reclaim-bounds-file-growth property and the
 reader-isolation-during-reclaim property.
 
+### Overflow pages for oversized values
+
+A value over `INLINE_VALUE_LIMIT` (512 bytes) doesn't get stored inline in
+its leaf; it's chunked across a singly-linked chain of dedicated overflow
+pages (`storage/overflow.rs`), and the leaf holds only a small
+`StoredValue::Overflow { head, len }` reference. Without this, a single
+large record would make a leaf permanently too big to fit in one page —
+splitting can't help, since a leaf holding just that one oversized entry
+would still be too big no matter how it's divided.
+
+Overflow pages are written to disk immediately when created, unlike node
+pages (which stay staged in the write transaction's in-memory overlay
+until commit). That's safe because nothing commits a *path* to an
+overflow chain — the referencing leaf — until the transaction itself
+commits, so an uncommitted chain is exactly as invisible to other readers
+as an uncommitted node would be; and on rollback, the page numbers it used
+get silently reused by whatever transaction runs next, since `next_page`
+itself rewinds to the last committed value. Overwriting or deleting a key
+whose value was stored via overflow retires the whole old chain through
+the same free-list mechanism as any other obsoleted page.
+
+Keys always stay inline — CICS/VSAM keys (RIDFLDs) are conventionally
+small, fixed-length fields, so this is a deliberate scope boundary, not
+an oversight.
+
 ## Layout
 
 ```
@@ -66,6 +91,7 @@ src/
     codec.rs         checksummed page (de)serialization
     btree.rs         copy-on-write B-tree (get/put/delete/range, merge-on-delete)
     freelist.rs      persisted free-page chain (load/store)
+    overflow.rs      chunked storage for oversized values
     txn.rs           Environment / ReadTxn / WriteTxn, reader-watermark tracking
   runtime/           the CICS-style layer, built on storage
     task.rs           Task Control: task ids, EIB
@@ -119,14 +145,18 @@ the store to prove committed data survives a restart.
 - **Free-list pages themselves are never recycled** (only the *data* pages
   they describe are): each commit writes its updated free list out as a
   fresh chain and abandons the previous one, to avoid the bootstrapping
-  problem of a free list needing to allocate from itself. This leaks a
-  small, *bounded* (not data-proportional) number of pages per commit —
-  see `storage/freelist.rs` module docs.
+  problem of a free list needing to allocate from itself. Concretely this
+  leaks one (occasionally two) bookkeeping pages *per commit* — bounded
+  per-commit, but linear in the number of commits over the life of a
+  store, not in how much data changed. `tests/storage_smoke.rs`'s reuse
+  tests account for this known overhead explicitly rather than asserting
+  zero growth. See `storage/freelist.rs` module docs.
 - **Free-list lookup is a linear scan** (`Vec` + `.position()`), fine at
   this scale/test-suite size; a real engine would index reclaimable pages
   by txn id for O(log n) lookup instead.
-- **No overflow pages**: a single key+value must fit well within one 4 KB
-  page (~3 KB budget); there's no chaining for large records yet.
+- **Keys must stay small** (well under one page): only *values* get
+  overflow-page support; a single oversized key still hits the page-size
+  assertion. See "Overflow pages for oversized values" above.
 - **Single global writer**: matches LMDB's model and keeps the design
   simple/correct, but it means no write concurrency — writers serialize
   even across unrelated files/tasks.

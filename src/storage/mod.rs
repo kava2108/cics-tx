@@ -6,6 +6,7 @@
 pub mod btree;
 pub mod codec;
 pub mod freelist;
+pub mod overflow;
 pub mod pager;
 pub mod txn;
 

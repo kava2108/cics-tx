@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::codec::{decode_page, encode_page, encoded_len};
+use super::overflow;
 use super::pager::{PageId, Pager};
 
 const SPLIT_THRESHOLD: usize = 3072;
@@ -29,12 +30,25 @@ const SPLIT_THRESHOLD: usize = 3072;
 /// merged node to still fit in one page) so split and merge can't thrash
 /// against each other.
 const MERGE_THRESHOLD: usize = SPLIT_THRESHOLD / 4;
+/// Values at or under this size stay inline in the leaf; larger ones move
+/// to an overflow chain (see `storage::overflow`) so a single big record
+/// can't blow a leaf past `SPLIT_THRESHOLD` no matter how it's split.
+/// Keys always stay inline -- CICS/VSAM keys (RIDFLDs) are conventionally
+/// small fixed-length fields, so this is a deliberate, not accidental,
+/// scope boundary; see the README.
+const INLINE_VALUE_LIMIT: usize = 512;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoredValue {
+    Inline(Vec<u8>),
+    Overflow { head: PageId, len: u64 },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Node {
     Leaf {
         keys: Vec<Vec<u8>>,
-        values: Vec<Vec<u8>>,
+        values: Vec<StoredValue>,
     },
     Internal {
         keys: Vec<Vec<u8>>,
@@ -58,6 +72,13 @@ fn child_index(keys: &[Vec<u8>], key: &[u8]) -> usize {
     keys.partition_point(|k| k.as_slice() <= key)
 }
 
+fn resolve_value(pager: &Pager, value: &StoredValue) -> Vec<u8> {
+    match value {
+        StoredValue::Inline(bytes) => bytes.clone(),
+        StoredValue::Overflow { head, len } => overflow::read_chain(pager, *head, *len),
+    }
+}
+
 pub fn get(pager: &Pager, overlay: &Overlay, root: Option<PageId>, key: &[u8]) -> Option<Vec<u8>> {
     let mut cur = root?;
     loop {
@@ -66,7 +87,7 @@ pub fn get(pager: &Pager, overlay: &Overlay, root: Option<PageId>, key: &[u8]) -
                 return keys
                     .binary_search_by(|k| k.as_slice().cmp(key))
                     .ok()
-                    .map(|i| values[i].clone());
+                    .map(|i| resolve_value(pager, &values[i]));
             }
             Node::Internal { keys, children } => {
                 cur = children[child_index(&keys, key)];
@@ -102,9 +123,9 @@ fn collect(
 ) {
     match read_node(pager, overlay, node_id) {
         Node::Leaf { keys, values } => {
-            for (k, v) in keys.into_iter().zip(values.into_iter()) {
+            for (k, v) in keys.into_iter().zip(values.iter()) {
                 if start.map_or(true, |s| k.as_slice() >= s) && end.map_or(true, |e| k.as_slice() < e) {
-                    out.push((k, v));
+                    out.push((k, resolve_value(pager, v)));
                 }
             }
         }
@@ -219,6 +240,43 @@ impl<'a> Ctx<'a> {
     fn read(&self, id: PageId) -> Node {
         read_node(self.pager, self.overlay, id)
     }
+
+    /// Encodes `value` for storage: inline if it's small, or written out
+    /// as an overflow chain (immediately, not deferred -- see
+    /// `storage::overflow`'s module doc for why that's safe) if not.
+    fn store_value(&mut self, value: &[u8]) -> StoredValue {
+        if value.len() <= INLINE_VALUE_LIMIT {
+            return StoredValue::Inline(value.to_vec());
+        }
+        let chunks: Vec<&[u8]> = value.chunks(overflow::CHUNK).collect();
+        let mut next: Option<PageId> = None;
+        for chunk in chunks.iter().rev() {
+            let id = self.alloc();
+            let page = overflow::OverflowPage { next, data: chunk.to_vec() };
+            self.pager.write_page(id, &encode_page(&page)).expect("write overflow page");
+            next = Some(id);
+        }
+        StoredValue::Overflow { head: next.expect("value is non-empty here"), len: value.len() as u64 }
+    }
+
+    /// Call when `value` is being discarded (overwritten by a REWRITE, or
+    /// the key it belongs to is being deleted). A no-op for inline
+    /// values; for an overflow chain, every page in it is reclaimed the
+    /// same way any other obsoleted page is. Unlike `retire()`, overflow
+    /// pages never go through `scratch_pool`: they're never staged in the
+    /// node `overlay` in the first place (they're written directly, see
+    /// `store_value`), so there's nothing to remove from there -- they're
+    /// simply handed to `obsolete` for a *future* transaction to reuse.
+    fn retire_value(&mut self, value: &StoredValue) {
+        let StoredValue::Overflow { head, .. } = value else { return };
+        let mut cur = Some(*head);
+        while let Some(id) = cur {
+            let buf = self.pager.read_page(id).expect("read overflow page");
+            let page: overflow::OverflowPage = decode_page(&buf).expect("decode overflow page");
+            self.obsolete.push(id);
+            cur = page.next;
+        }
+    }
 }
 
 /// Result of descending into a child: its (possibly new) id, and, if the
@@ -231,10 +289,13 @@ fn insert_rec(ctx: &mut Ctx, node_id: PageId, key: &[u8], value: &[u8]) -> Desce
     match ctx.read(node_id) {
         Node::Leaf { mut keys, mut values } => {
             match keys.binary_search_by(|k| k.as_slice().cmp(key)) {
-                Ok(idx) => values[idx] = value.to_vec(),
+                Ok(idx) => {
+                    ctx.retire_value(&values[idx]); // being overwritten
+                    values[idx] = ctx.store_value(value);
+                }
                 Err(idx) => {
                     keys.insert(idx, key.to_vec());
-                    values.insert(idx, value.to_vec());
+                    values.insert(idx, ctx.store_value(value));
                 }
             }
             let node = Node::Leaf { keys, values };
@@ -309,8 +370,9 @@ fn insert_rec(ctx: &mut Ctx, node_id: PageId, key: &[u8], value: &[u8]) -> Desce
 pub fn put(ctx: &mut Ctx, root: Option<PageId>, key: &[u8], value: &[u8]) -> PageId {
     match root {
         None => {
+            let stored = ctx.store_value(value);
             let id = ctx.alloc();
-            ctx.put_node(id, Node::Leaf { keys: vec![key.to_vec()], values: vec![value.to_vec()] });
+            ctx.put_node(id, Node::Leaf { keys: vec![key.to_vec()], values: vec![stored] });
             id
         }
         Some(root_id) => {
@@ -368,7 +430,8 @@ fn delete_rec(ctx: &mut Ctx, node_id: PageId, key: &[u8]) -> (PageId, bool) {
             let removed = match keys.binary_search_by(|k| k.as_slice().cmp(key)) {
                 Ok(idx) => {
                     keys.remove(idx);
-                    values.remove(idx);
+                    let old_value = values.remove(idx);
+                    ctx.retire_value(&old_value);
                     true
                 }
                 Err(_) => false,

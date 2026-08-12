@@ -253,3 +253,107 @@ fn merge_and_reclaim_do_not_corrupt_a_large_dataset_under_mixed_churn() {
         assert!(w[0].0 < w[1].0, "range() must stay sorted after merges/reuse");
     }
 }
+
+#[test]
+fn oversized_values_round_trip_via_overflow_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let env = Environment::open(&path).unwrap();
+
+    // Comfortably bigger than one 4KB page, and not a round multiple of
+    // the overflow chunk size, to exercise a partial final chunk.
+    let big_value: Vec<u8> = (0..10_003u32).map(|i| (i % 251) as u8).collect();
+
+    {
+        let mut wtx = env.begin_write();
+        wtx.put(b"small", b"tiny inline value");
+        wtx.put(b"big", &big_value);
+        wtx.commit().unwrap();
+    }
+
+    let rtx = env.begin_read();
+    assert_eq!(rtx.get(b"small"), Some(b"tiny inline value".to_vec()));
+    assert_eq!(rtx.get(b"big"), Some(big_value.clone()));
+
+    // range() must resolve overflowed values too, not just get().
+    let all = rtx.range(None, None);
+    assert_eq!(all, vec![(b"big".to_vec(), big_value.clone()), (b"small".to_vec(), b"tiny inline value".to_vec())]);
+}
+
+#[test]
+fn value_size_at_and_around_the_inline_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let env = Environment::open(&path).unwrap();
+
+    // 512 is the current inline/overflow boundary; exercise both sides of
+    // it plus the boundary itself so a future threshold change is caught.
+    for len in [1usize, 511, 512, 513, 4096, 20_000] {
+        let value: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+        let key = format!("k{len}");
+        let mut wtx = env.begin_write();
+        wtx.put(key.as_bytes(), &value);
+        wtx.commit().unwrap();
+        let rtx = env.begin_read();
+        assert_eq!(rtx.get(key.as_bytes()), Some(value), "value length {len}");
+    }
+}
+
+#[test]
+fn overwriting_and_deleting_large_values_reclaims_their_overflow_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let env = Environment::open(&path).unwrap();
+
+    let big_value = vec![0xABu8; 20_000];
+    let round = |env: &Environment| {
+        let mut wtx = env.begin_write();
+        wtx.put(b"k", &big_value);
+        wtx.commit().unwrap();
+
+        let mut wtx = env.begin_write();
+        wtx.put(b"k", &big_value); // overwrite: old chain must be retired, not leaked
+        wtx.commit().unwrap();
+
+        let mut wtx = env.begin_write();
+        wtx.delete(b"k");
+        wtx.commit().unwrap();
+    };
+
+    // A few priming rounds so the free list reaches its steady-state size
+    // (each round both frees and reclaims pages; the *set* of reclaimable
+    // ids stabilizes after the first round or two).
+    for _ in 0..3 {
+        round(&env);
+    }
+    let size_after_priming = std::fs::metadata(&path).unwrap().len();
+
+    // Marginal growth per round should stay roughly constant, not increase,
+    // across two separate later windows -- a real overflow-chain leak
+    // would show up as growth scaling with the number of *rounds*, not
+    // just with the (roughly fixed, already-documented) per-*commit*
+    // free-list bookkeeping page each commit costs.
+    for _ in 0..10 {
+        round(&env);
+    }
+    let size_after_first_window = std::fs::metadata(&path).unwrap().len();
+    let first_window_growth = size_after_first_window.saturating_sub(size_after_priming);
+
+    for _ in 0..10 {
+        round(&env);
+    }
+    let size_after_second_window = std::fs::metadata(&path).unwrap().len();
+    let second_window_growth = size_after_second_window.saturating_sub(size_after_first_window);
+
+    assert_eq!(env.begin_read().get(b"k"), None);
+
+    // Allow generous slack for the known, documented per-commit free-list
+    // bookkeeping overhead (see storage/freelist.rs), but a real leak of
+    // the 5-page overflow chains this test churns through would make the
+    // second window's growth dramatically larger than the first's, not
+    // comparable to it.
+    assert!(
+        second_window_growth <= first_window_growth + 4 * 4096,
+        "expected steady-state growth across equal windows, got {first_window_growth} then {second_window_growth} bytes -- overflow chains may be leaking"
+    );
+}

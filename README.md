@@ -26,6 +26,37 @@ instead: a **copy-on-write B-tree with an atomic meta-page swap**.
 See `src/storage/btree.rs` and `src/storage/txn.rs` for the code-level
 rationale.
 
+### Space reclamation: merge-on-delete + a reader-aware free list
+
+Deleting a key doesn't just shrink a leaf and leave it sparse. Once a
+leaf or internal node's serialized size drops below a low-water mark, it's
+merged with a sibling (falling back from the right sibling to the left one
+if the right merge wouldn't fit in a page); root collapses when it's left
+with a single child. Every page a merge or an ordinary COW replacement
+makes unreachable is recorded as `(freed_at_txn_id, page_id)` in a
+persisted free list (`storage/freelist.rs`) instead of being abandoned.
+
+The catch is MVCC safety: a page freed at txn `F` might still be exactly
+what an already-open `ReadTxn` is reading, if that reader's snapshot
+predates `F`. So every `ReadTxn` registers its snapshot's txn id with the
+`Environment` on `begin_read()` and deregisters on drop; a `WriteTxn`
+computes a *reclaim watermark* (the oldest still-registered reader, or "no
+limit" if there are none) once at `begin_write()`, and only ever reuses a
+page whose `freed_at_txn_id <= watermark` — i.e., no live reader could
+possibly still need it. (Pages a transaction retires *within its own,
+not-yet-committed* work — e.g. a merge discarding a sibling that same
+transaction had already copy-on-written moments earlier — skip the
+watermark check entirely via an in-memory `scratch_pool`: nothing durable
+or reader-visible ever pointed at them, so they're safe to recycle
+immediately, which is what keeps a single delete-heavy transaction from
+burning through page numbers via its own merge cascades.)
+
+This mirrors VSAM's control-interval/control-area reuse: as records are
+deleted, the space they occupied comes back for reuse instead of only
+ever growing the dataset — see `tests/storage_smoke.rs` for tests
+covering both the reclaim-bounds-file-growth property and the
+reader-isolation-during-reclaim property.
+
 ## Layout
 
 ```
@@ -33,8 +64,9 @@ src/
   storage/          the embedded KV engine
     pager.rs         fixed-size page I/O, double-buffered meta page
     codec.rs         checksummed page (de)serialization
-    btree.rs         copy-on-write B-tree (get/put/delete/range)
-    txn.rs           Environment / ReadTxn / WriteTxn
+    btree.rs         copy-on-write B-tree (get/put/delete/range, merge-on-delete)
+    freelist.rs      persisted free-page chain (load/store)
+    txn.rs           Environment / ReadTxn / WriteTxn, reader-watermark tracking
   runtime/           the CICS-style layer, built on storage
     task.rs           Task Control: task ids, EIB
     program.rs         Program Control: registry + LINK/XCTL/RETURN
@@ -79,12 +111,20 @@ the store to prove committed data survives a restart.
 
 ## Known limitations (v1, by design — not oversights)
 
-- **No free-list / page reuse**: deleted/superseded pages are never
-  reclaimed, so the file only grows. A free-list keyed by the txn id after
-  which a page became unreachable (so it's safe to reuse once no reader
-  can still see it) is the natural v2 addition.
-- **No node merge/rebalance on delete**: leaves can become underfull;
-  correctness is unaffected, only space efficiency.
+- **Merge is best-effort, not a full rebalance**: a node only merges with
+  one sibling (right, falling back to left) and only when the combined
+  size still fits one page; there's no borrow-from-sibling redistribution
+  step, so a node can still end up modestly underfull with no eligible
+  merge partner. Correctness is unaffected either way.
+- **Free-list pages themselves are never recycled** (only the *data* pages
+  they describe are): each commit writes its updated free list out as a
+  fresh chain and abandons the previous one, to avoid the bootstrapping
+  problem of a free list needing to allocate from itself. This leaks a
+  small, *bounded* (not data-proportional) number of pages per commit —
+  see `storage/freelist.rs` module docs.
+- **Free-list lookup is a linear scan** (`Vec` + `.position()`), fine at
+  this scale/test-suite size; a real engine would index reclaimable pages
+  by txn id for O(log n) lookup instead.
 - **No overflow pages**: a single key+value must fit well within one 4 KB
   page (~3 KB budget); there's no chaining for large records yet.
 - **Single global writer**: matches LMDB's model and keeps the design

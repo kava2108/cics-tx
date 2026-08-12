@@ -26,15 +26,21 @@ pub struct Meta {
     pub txn_id: u64,
     pub root: Option<PageId>,
     pub next_page: PageId,
+    /// Head of the free-page list: pages obsoleted by past commits that
+    /// are no longer reachable from `root` and are safe to hand back out
+    /// once no active reader's snapshot still needs them. See
+    /// `storage::freelist`.
+    pub free_list_head: Option<PageId>,
 }
 
 impl Meta {
-    pub fn advance(&self, root: Option<PageId>, next_page: PageId) -> Meta {
+    pub fn advance(&self, root: Option<PageId>, next_page: PageId, free_list_head: Option<PageId>) -> Meta {
         Meta {
             magic: self.magic,
             txn_id: self.txn_id + 1,
             root,
             next_page,
+            free_list_head,
         }
     }
 
@@ -80,6 +86,7 @@ impl Pager {
                 txn_id: 0,
                 root: None,
                 next_page: META_PAGE_COUNT,
+                free_list_head: None,
             };
             pager.write_meta_slot(0, &meta)?;
             pager.write_meta_slot(1, &meta)?;

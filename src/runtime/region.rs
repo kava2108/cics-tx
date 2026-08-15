@@ -251,3 +251,40 @@ impl<'a, 'env> ExecCtx<'a, 'env> {
         *self.txn = Some(self.env.begin_write());
     }
 }
+
+/// EXEC CICS LINK for callers that don't use `Region`/`Region::start_task`
+/// at all — e.g. an external RPC gateway that owns its own `Environment` /
+/// `FileControlTable` and drives a `WriteTxn` across several separate
+/// calls (its unit of work isn't "one task, run to completion", so
+/// `Region::start_task`'s own implicit-syncpoint-on-return wouldn't just
+/// be redundant, it would be wrong: it would commit or roll back storage
+/// state the external caller still considers open).
+///
+/// This performs no SYNCPOINT of its own, matching real CICS: LINK never
+/// implicitly syncpoints, only the caller's own SYNCPOINT (or a task
+/// ending) does. `txn` is used and left exactly as the caller had it —
+/// open on success, open (but possibly mutated) on error, same as any
+/// other `ExecCtx` File Control call.
+///
+/// `EXEC CICS START` issued anywhere in the linked call chain is queued
+/// into a private, throwaway queue and silently dropped when this
+/// function returns: there is no `Region` dispatch loop here to drain it.
+/// A gateway that needs `START` support will need more than this.
+pub fn link_external<'env>(
+    env: &'env Environment,
+    programs: &ProgramManager,
+    fct: &FileControlTable,
+    txn: &mut Option<WriteTxn<'env>>,
+    eib: &Eib,
+    program: &str,
+    commarea: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    let mut new_eib = eib.clone();
+    new_eib.link_level += 1;
+    if new_eib.link_level > MAX_LINK_DEPTH {
+        return Err(crate::error::CicsError::LinkStackOverflow(program.to_string()));
+    }
+    let mut pending_starts = VecDeque::new();
+    let task_ids = TaskIdGenerator::new();
+    run_program_loop(env, programs, fct, txn, &mut pending_starts, &task_ids, new_eib, program.to_string(), commarea.map(|c| c.to_vec()))
+}

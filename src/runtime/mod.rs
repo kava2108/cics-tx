@@ -8,5 +8,5 @@ pub mod region;
 pub mod task;
 
 pub use program::{CicsProgram, ProgramManager, ProgramOutcome};
-pub use region::{ExecCtx, Region};
-pub use task::{Eib, TaskId};
+pub use region::{link_external, ExecCtx, Region};
+pub use task::{Eib, TaskId, TaskIdGenerator};
